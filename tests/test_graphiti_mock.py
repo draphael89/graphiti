@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
+import graphiti_core.graphiti as graphiti_module
 from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.edges import CommunityEdge, EntityEdge, EpisodicEdge
+from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.graphiti import Graphiti
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
@@ -47,7 +50,7 @@ from graphiti_core.search.search_utils import (
     node_fulltext_search,
     node_similarity_search,
 )
-from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
+from graphiti_core.utils.bulk_utils import RawEpisode, add_nodes_and_edges_bulk
 from graphiti_core.utils.maintenance.community_operations import (
     determine_entity_community,
     get_community_clusters,
@@ -113,6 +116,621 @@ def mock_cross_encoder_client():
     }
 
     return mock_llm
+
+
+class NoIoGraphDriver(GraphDriver):
+    provider = GraphProvider.NEO4J
+    graph_operations_interface = None
+
+    def __init__(self, database='default_db'):
+        self._database = database
+
+    async def execute_query(self, cypher_query_, **kwargs):
+        raise AssertionError('execute_query should not be called')
+
+    def session(self, database=None):
+        raise AssertionError('session should not be called')
+
+    async def close(self):
+        pass
+
+    async def delete_all_indexes(self):
+        pass
+
+    async def build_indices_and_constraints(self, delete_existing=False):
+        pass
+
+    def clone(self, database):
+        return NoIoGraphDriver(database=database)
+
+
+def no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client):
+    return Graphiti(
+        graph_driver=NoIoGraphDriver(),
+        llm_client=mock_llm_client,
+        embedder=mock_embedder,
+        cross_encoder=mock_cross_encoder_client,
+    )
+
+
+def deterministic_episode(
+    uuid,
+    reference_time,
+    *,
+    name='deterministic episode',
+    content='user: Alice likes Bob',
+    episode_group_id=group_id,
+):
+    return EpisodicNode(
+        uuid=uuid,
+        name=name,
+        labels=[],
+        source=EpisodeType.message,
+        content=content,
+        source_description='test',
+        group_id=episode_group_id,
+        created_at=datetime.now(),
+        valid_at=reference_time,
+    )
+
+
+def deterministic_raw_episode(
+    uuid,
+    reference_time,
+    *,
+    name='deterministic episode',
+    content='user: Alice likes Bob',
+):
+    return RawEpisode(
+        uuid=uuid,
+        name=name,
+        content=content,
+        source_description='test',
+        source=EpisodeType.message,
+        reference_time=reference_time,
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_new_uuid_creates_episode(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+
+    async def missing_episode(cls, driver, uuid):
+        raise NodeNotFoundError(uuid)
+
+    async def no_previous_episodes(self, *args, **kwargs):
+        return []
+
+    async def no_extracted_nodes(*args, **kwargs):
+        return [], {}
+
+    async def no_resolved_nodes(*args, **kwargs):
+        return [], {}, []
+
+    async def no_resolved_edges(self, *args, **kwargs):
+        return [], [], []
+
+    async def no_hydrated_nodes(*args, **kwargs):
+        return []
+
+    async def return_episode(self, episode, *args, **kwargs):
+        return [], episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(missing_episode))
+    monkeypatch.setattr(Graphiti, 'retrieve_episodes', no_previous_episodes)
+    monkeypatch.setattr(graphiti_module, 'extract_nodes', no_extracted_nodes)
+    monkeypatch.setattr(graphiti_module, 'resolve_extracted_nodes', no_resolved_nodes)
+    monkeypatch.setattr(Graphiti, '_extract_and_resolve_edges', no_resolved_edges)
+    monkeypatch.setattr(graphiti_module, 'extract_attributes_from_nodes', no_hydrated_nodes)
+    monkeypatch.setattr(Graphiti, '_process_episode_data', return_episode)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode(
+        name='deterministic episode',
+        episode_body='user: Alice likes Bob',
+        source_description='test',
+        reference_time=datetime.now(),
+        source=EpisodeType.message,
+        group_id=group_id,
+        uuid=requested_uuid,
+    )
+
+    assert result.episode.uuid == requested_uuid
+    assert result.episode.group_id == group_id
+    assert result.episode.content == 'user: Alice likes Bob'
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_existing_uuid_returns_without_processing(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    async def should_not_retrieve_previous_episodes(self, *args, **kwargs):
+        raise AssertionError('existing uuid replay should not retrieve previous episodes')
+
+    async def should_not_extract_nodes(*args, **kwargs):
+        raise AssertionError('existing uuid replay should not extract nodes')
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+    monkeypatch.setattr(Graphiti, 'retrieve_episodes', should_not_retrieve_previous_episodes)
+    monkeypatch.setattr(graphiti_module, 'extract_nodes', should_not_extract_nodes)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode(
+        name='deterministic episode',
+        episode_body='user: Alice likes Bob',
+        source_description='test',
+        reference_time=reference_time,
+        source=EpisodeType.message,
+        group_id=group_id,
+        uuid=requested_uuid,
+        update_communities=True,
+        previous_episode_uuids=['22222222-2222-4222-8222-222222222222'],
+    )
+
+    assert result.episode == existing_episode
+    assert result.episodic_edges == []
+    assert result.nodes == []
+    assert result.edges == []
+    assert result.communities == []
+    assert result.community_edges == []
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_existing_uuid_rejects_saga_replay(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='saga replay'):
+        await graphiti.add_episode(
+            name='deterministic episode',
+            episode_body='user: Alice likes Bob',
+            source_description='test',
+            reference_time=reference_time,
+            source=EpisodeType.message,
+            group_id=group_id,
+            uuid=requested_uuid,
+            saga='retry saga',
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_existing_uuid_rejects_payload_mismatch(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='different payload'):
+        await graphiti.add_episode(
+            name='deterministic episode',
+            episode_body='user: Alice likes Carol',
+            source_description='test',
+            reference_time=reference_time,
+            source=EpisodeType.message,
+            group_id=group_id,
+            uuid=requested_uuid,
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_existing_uuid_rejects_group_mismatch(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(
+        requested_uuid,
+        reference_time,
+        episode_group_id=group_id_2,
+    )
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='different group_id'):
+        await graphiti.add_episode(
+            name='deterministic episode',
+            episode_body='user: Alice likes Bob',
+            source_description='test',
+            reference_time=reference_time,
+            source=EpisodeType.message,
+            group_id=group_id,
+            uuid=requested_uuid,
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_existing_uuid_accepts_equivalent_reference_time(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime(2026, 4, 24, 12, 0, 0, tzinfo=timezone.utc)
+    existing_episode = deterministic_episode(
+        requested_uuid,
+        datetime(2026, 4, 24, 8, 0, 0, tzinfo=timezone(timedelta(hours=-4))),
+    )
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode(
+        name='deterministic episode',
+        episode_body='user: Alice likes Bob',
+        source_description='test',
+        reference_time=reference_time,
+        source=EpisodeType.message,
+        group_id=group_id,
+        uuid=requested_uuid,
+    )
+
+    assert result.episode == existing_episode
+
+
+@pytest.mark.asyncio
+async def test_add_episode_with_uuid_rejects_raw_content_disabled_replay(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time, content='')
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+    graphiti.store_raw_episode_content = False
+
+    with pytest.raises(ValueError, match='deterministic UUIDs require raw episode content storage'):
+        await graphiti.add_episode(
+            name='deterministic episode',
+            episode_body='user: Alice likes Bob',
+            source_description='test',
+            reference_time=reference_time,
+            source=EpisodeType.message,
+            group_id=group_id,
+            uuid=requested_uuid,
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_existing_uuid_returns_without_processing(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    async def should_not_add_nodes_and_edges_bulk(*args, **kwargs):
+        raise AssertionError('existing uuid bulk replay should not save graph data')
+
+    async def should_not_retrieve_previous_episodes_bulk(*args, **kwargs):
+        raise AssertionError('existing uuid bulk replay should not retrieve context')
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+    monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', should_not_add_nodes_and_edges_bulk)
+    monkeypatch.setattr(
+        graphiti_module,
+        'retrieve_previous_episodes_bulk',
+        should_not_retrieve_previous_episodes_bulk,
+    )
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode_bulk(
+        [
+            deterministic_raw_episode(requested_uuid, reference_time)
+        ],
+        group_id=group_id,
+    )
+
+    assert result.episodes == [existing_episode]
+    assert result.episodic_edges == []
+    assert result.nodes == []
+    assert result.edges == []
+    assert result.communities == []
+    assert result.community_edges == []
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_uuid_rejects_raw_content_disabled_replay(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time, content='')
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+    graphiti.store_raw_episode_content = False
+
+    with pytest.raises(ValueError, match='deterministic UUIDs require raw episode content storage'):
+        await graphiti.add_episode_bulk(
+            [deterministic_raw_episode(requested_uuid, reference_time)],
+            group_id=group_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_existing_uuid_rejects_saga_replay(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='saga replay'):
+        await graphiti.add_episode_bulk(
+            [deterministic_raw_episode(requested_uuid, reference_time)],
+            group_id=group_id,
+            saga='retry saga',
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_new_uuid_saves_once_after_extraction(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    saved_batches: list[list[EpisodicNode]] = []
+
+    async def missing_episode(cls, driver, uuid):
+        raise NodeNotFoundError(uuid)
+
+    async def capture_add_nodes_and_edges_bulk(
+        driver, episodic_nodes, episodic_edges, entity_nodes, entity_edges, embedder
+    ):
+        saved_batches.append(list(episodic_nodes))
+
+    async def no_previous_episodes(driver, episodes):
+        return [(episode, []) for episode in episodes]
+
+    async def no_extracted_nodes(self, *args, **kwargs):
+        return {}, {}, []
+
+    async def no_edges(*args, **kwargs):
+        return []
+
+    async def no_resolved_nodes_and_edges(self, *args, **kwargs):
+        return [], [], [], {}
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(missing_episode))
+    monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', capture_add_nodes_and_edges_bulk)
+    monkeypatch.setattr(graphiti_module, 'retrieve_previous_episodes_bulk', no_previous_episodes)
+    monkeypatch.setattr(Graphiti, '_extract_and_dedupe_nodes_bulk', no_extracted_nodes)
+    monkeypatch.setattr(graphiti_module, 'dedupe_edges_bulk', no_edges)
+    monkeypatch.setattr(Graphiti, '_resolve_nodes_and_edges_bulk', no_resolved_nodes_and_edges)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode_bulk(
+        [
+            deterministic_raw_episode(requested_uuid, reference_time)
+        ],
+        group_id=group_id,
+    )
+
+    assert result.episodes[0].uuid == requested_uuid
+    assert result.episodes[0].content == 'user: Alice likes Bob'
+    assert [[episode.uuid for episode in batch] for batch in saved_batches] == [[requested_uuid]]
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_mixed_existing_and_new_uuids_preserves_order(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    existing_uuid = '11111111-1111-4111-8111-111111111111'
+    new_uuid = '22222222-2222-4222-8222-222222222222'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(
+        existing_uuid,
+        reference_time,
+        name='existing deterministic episode',
+    )
+    saved_episodes: list[EpisodicNode] = []
+
+    async def lookup_episode(cls, driver, uuid):
+        if uuid == existing_uuid:
+            return existing_episode
+        raise NodeNotFoundError(uuid)
+
+    async def capture_add_nodes_and_edges_bulk(
+        driver, episodic_nodes, episodic_edges, entity_nodes, entity_edges, embedder
+    ):
+        saved_episodes.extend(episodic_nodes)
+
+    async def no_previous_episodes(driver, episodes):
+        return [(episode, []) for episode in episodes]
+
+    async def no_extracted_nodes(self, *args, **kwargs):
+        return {}, {}, []
+
+    async def no_edges(*args, **kwargs):
+        return []
+
+    async def no_resolved_nodes_and_edges(self, *args, **kwargs):
+        return [], [], [], {}
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(lookup_episode))
+    monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', capture_add_nodes_and_edges_bulk)
+    monkeypatch.setattr(graphiti_module, 'retrieve_previous_episodes_bulk', no_previous_episodes)
+    monkeypatch.setattr(Graphiti, '_extract_and_dedupe_nodes_bulk', no_extracted_nodes)
+    monkeypatch.setattr(graphiti_module, 'dedupe_edges_bulk', no_edges)
+    monkeypatch.setattr(Graphiti, '_resolve_nodes_and_edges_bulk', no_resolved_nodes_and_edges)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode_bulk(
+        [
+            deterministic_raw_episode(
+                existing_uuid,
+                reference_time,
+                name='existing deterministic episode',
+            ),
+            deterministic_raw_episode(
+                new_uuid,
+                reference_time,
+                name='new deterministic episode',
+            ),
+        ],
+        group_id=group_id,
+    )
+
+    assert [episode.uuid for episode in result.episodes] == [existing_uuid, new_uuid]
+    assert [episode.uuid for episode in saved_episodes] == [new_uuid]
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_rejects_duplicate_new_uuid_in_same_request(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+
+    async def missing_episode(cls, driver, uuid):
+        raise NodeNotFoundError(uuid)
+
+    async def should_not_retrieve_previous_episodes_bulk(*args, **kwargs):
+        raise AssertionError('duplicate uuid bulk request should not retrieve context')
+
+    async def should_not_add_nodes_and_edges_bulk(*args, **kwargs):
+        raise AssertionError('duplicate uuid bulk request should not save graph data')
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(missing_episode))
+    monkeypatch.setattr(
+        graphiti_module,
+        'retrieve_previous_episodes_bulk',
+        should_not_retrieve_previous_episodes_bulk,
+    )
+    monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', should_not_add_nodes_and_edges_bulk)
+
+    duplicate_episodes = (
+        deterministic_raw_episode(requested_uuid, reference_time),
+        deterministic_raw_episode(
+            requested_uuid,
+            reference_time,
+            content='user: Alice likes Carol',
+        ),
+    )
+
+    for duplicate_episode in duplicate_episodes:
+        graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+        with pytest.raises(ValueError, match='appears more than once'):
+            await graphiti.add_episode_bulk(
+                [
+                    deterministic_raw_episode(requested_uuid, reference_time),
+                    duplicate_episode,
+                ],
+                group_id=group_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_existing_uuid_rejects_payload_mismatch(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(requested_uuid, reference_time)
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='different payload'):
+        await graphiti.add_episode_bulk(
+            [
+                deterministic_raw_episode(
+                    requested_uuid,
+                    reference_time,
+                    content='user: Alice likes Carol',
+                )
+            ],
+            group_id=group_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_existing_uuid_rejects_group_mismatch(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(
+        requested_uuid,
+        reference_time,
+        episode_group_id=group_id_2,
+    )
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    with pytest.raises(ValueError, match='different group_id'):
+        await graphiti.add_episode_bulk(
+            [deterministic_raw_episode(requested_uuid, reference_time)],
+            group_id=group_id,
+        )
 
 
 @pytest.mark.asyncio
