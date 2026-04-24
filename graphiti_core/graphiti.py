@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from time import time
 from uuid import uuid4
 
@@ -127,6 +127,42 @@ class AddBulkEpisodeResults(BaseModel):
     edges: list[EntityEdge]
     communities: list[CommunityNode]
     community_edges: list[CommunityEdge]
+
+
+def _validate_existing_episode_replay(
+    episode: EpisodicNode,
+    uuid: str,
+    group_id: str,
+    name: str,
+    episode_body: str,
+    source_description: str,
+    source: EpisodeType,
+    reference_time: datetime,
+) -> None:
+    if episode.group_id != group_id:
+        raise ValueError(f'Episode {uuid} exists with different group_id {episode.group_id}')
+
+    if (
+        episode.name != name
+        or episode.content != episode_body
+        or episode.source_description != source_description
+        or episode.source != source
+        or _utc_instant(episode.valid_at) != _utc_instant(reference_time)
+    ):
+        raise ValueError(f'Episode {uuid} exists with different payload')
+
+
+def _validate_raw_content_storage_for_deterministic_uuid(
+    store_raw_episode_content: bool, uuid: str | None
+) -> None:
+    if uuid is not None and not store_raw_episode_content:
+        raise ValueError('deterministic UUIDs require raw episode content storage')
+
+
+def _utc_instant(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class AddTripletResults(BaseModel):
@@ -1081,8 +1117,60 @@ class Graphiti:
                 self.driver = self.driver.clone(database=group_id)
                 self.clients.driver = self.driver
 
+        _validate_raw_content_storage_for_deterministic_uuid(
+            self.store_raw_episode_content, uuid
+        )
+
         with self.tracer.start_span('add_episode') as span:
             try:
+                if uuid is not None:
+                    try:
+                        episode = await EpisodicNode.get_by_uuid(self.driver, uuid)
+                        if saga is not None:
+                            raise ValueError(
+                                f'Episode {uuid} saga replay is not supported for deterministic UUIDs'
+                            )
+                        _validate_existing_episode_replay(
+                            episode,
+                            uuid,
+                            group_id,
+                            name,
+                            episode_body,
+                            source_description,
+                            source,
+                            reference_time,
+                        )
+                        end = time()
+                        span.add_attributes(
+                            {
+                                'episode.uuid': episode.uuid,
+                                'episode.source': episode.source.value,
+                                'episode.reference_time': episode.valid_at.isoformat(),
+                                'group_id': group_id,
+                                'node.count': 0,
+                                'edge.count': 0,
+                                'edge.invalidated_count': 0,
+                                'previous_episodes.count': 0,
+                                'entity_types.count': len(entity_types) if entity_types else 0,
+                                'edge_types.count': len(edge_types) if edge_types else 0,
+                                'update_communities': update_communities,
+                                'communities.count': 0,
+                                'duration_ms': (end - start) * 1000,
+                            }
+                        )
+                        logger.info(f'Completed add_episode replay in {(end - start) * 1000} ms')
+
+                        return AddEpisodeResults(
+                            episode=episode,
+                            episodic_edges=[],
+                            nodes=[],
+                            edges=[],
+                            communities=[],
+                            community_edges=[],
+                        )
+                    except NodeNotFoundError:
+                        pass
+
                 # Retrieve previous episodes for context
                 previous_episodes = (
                     await self.retrieve_episodes(
@@ -1095,21 +1183,19 @@ class Graphiti:
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
                 )
 
-                # Get or create episode
-                episode = (
-                    await EpisodicNode.get_by_uuid(self.driver, uuid)
-                    if uuid is not None
-                    else EpisodicNode(
-                        name=name,
-                        group_id=group_id,
-                        labels=[],
-                        source=source,
-                        content=episode_body,
-                        source_description=source_description,
-                        created_at=now,
-                        valid_at=reference_time,
-                    )
-                )
+                episode_kwargs = {
+                    'name': name,
+                    'group_id': group_id,
+                    'labels': [],
+                    'source': source,
+                    'content': episode_body,
+                    'source_description': source_description,
+                    'created_at': now,
+                    'valid_at': reference_time,
+                }
+                if uuid is not None:
+                    episode_kwargs['uuid'] = uuid
+                episode = EpisodicNode(**episode_kwargs)
 
                 # Create default edge type map
                 edge_type_map_default = (
@@ -1316,34 +1402,81 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
-                episodes = [
-                    await EpisodicNode.get_by_uuid(self.driver, episode.uuid)
-                    if episode.uuid is not None
-                    else EpisodicNode(
-                        name=episode.name,
-                        labels=[],
-                        source=episode.source,
-                        content=episode.content,
-                        source_description=episode.source_description,
-                        group_id=group_id,
-                        created_at=now,
-                        valid_at=episode.reference_time,
-                    )
-                    for episode in bulk_episodes
-                ]
+                episodes: list[EpisodicNode] = []
+                new_episodes: list[EpisodicNode] = []
+                requested_uuids: set[str] = set()
 
-                # Save all episodes
-                await add_nodes_and_edges_bulk(
-                    driver=self.driver,
-                    episodic_nodes=episodes,
-                    episodic_edges=[],
-                    entity_nodes=[],
-                    entity_edges=[],
-                    embedder=self.embedder,
-                )
+                for raw_episode in bulk_episodes:
+                    _validate_raw_content_storage_for_deterministic_uuid(
+                        self.store_raw_episode_content, raw_episode.uuid
+                    )
+                    if raw_episode.uuid is not None:
+                        if raw_episode.uuid in requested_uuids:
+                            raise ValueError(
+                                f'Episode {raw_episode.uuid} appears more than once in bulk request'
+                            )
+                        requested_uuids.add(raw_episode.uuid)
+                        try:
+                            episode = await EpisodicNode.get_by_uuid(self.driver, raw_episode.uuid)
+                            if saga is not None:
+                                raise ValueError(
+                                    f'Episode {raw_episode.uuid} saga replay is not supported for deterministic UUIDs'
+                                )
+                            _validate_existing_episode_replay(
+                                episode,
+                                raw_episode.uuid,
+                                group_id,
+                                raw_episode.name,
+                                raw_episode.content,
+                                raw_episode.source_description,
+                                raw_episode.source,
+                                raw_episode.reference_time,
+                            )
+                            episodes.append(episode)
+                            continue
+                        except NodeNotFoundError:
+                            pass
+
+                    episode_kwargs = {
+                        'name': raw_episode.name,
+                        'labels': [],
+                        'source': raw_episode.source,
+                        'content': raw_episode.content,
+                        'source_description': raw_episode.source_description,
+                        'group_id': group_id,
+                        'created_at': now,
+                        'valid_at': raw_episode.reference_time,
+                    }
+                    if raw_episode.uuid is not None:
+                        episode_kwargs['uuid'] = raw_episode.uuid
+
+                    episode = EpisodicNode(**episode_kwargs)
+                    episodes.append(episode)
+                    new_episodes.append(episode)
+
+                if not new_episodes:
+                    end = time()
+                    bulk_span.add_attributes(
+                        {
+                            'group_id': group_id,
+                            'node.count': 0,
+                            'edge.count': 0,
+                            'duration_ms': (end - start) * 1000,
+                        }
+                    )
+                    logger.info(f'Completed add_episode_bulk replay in {(end - start) * 1000} ms')
+
+                    return AddBulkEpisodeResults(
+                        episodes=episodes,
+                        episodic_edges=[],
+                        nodes=[],
+                        edges=[],
+                        communities=[],
+                        community_edges=[],
+                    )
 
                 # Get previous episode context for each episode
-                episode_context = await retrieve_previous_episodes_bulk(self.driver, episodes)
+                episode_context = await retrieve_previous_episodes_bulk(self.driver, new_episodes)
 
                 # Extract and dedupe nodes and edges
                 (
@@ -1391,7 +1524,7 @@ class Graphiti:
                     entity_types,
                     edge_types,
                     edge_type_map or edge_type_map_default,
-                    episodes,
+                    new_episodes,
                 )
 
                 # Resolved pointers for episodic edges
@@ -1400,7 +1533,7 @@ class Graphiti:
                 # save data to KG
                 await add_nodes_and_edges_bulk(
                     self.driver,
-                    episodes,
+                    new_episodes,
                     resolved_episodic_edges,
                     final_hydrated_nodes,
                     resolved_edges + invalidated_edges,
@@ -1421,7 +1554,7 @@ class Graphiti:
                         saga_node = saga
 
                     # Sort episodes by valid_at to create NEXT_EPISODE chain in correct order
-                    sorted_episodes = sorted(episodes, key=lambda e: e.valid_at)
+                    sorted_episodes = sorted(new_episodes, key=lambda e: e.valid_at)
 
                     # Find the most recent episode already in the saga
                     previous_episode_uuid = await self._saga_get_previous_episode_uuid(
