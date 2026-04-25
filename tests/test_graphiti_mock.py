@@ -160,6 +160,7 @@ def deterministic_episode(
     name='deterministic episode',
     content='user: Alice likes Bob',
     episode_group_id=group_id,
+    graphiti_ingest_complete=True,
 ):
     return EpisodicNode(
         uuid=uuid,
@@ -171,6 +172,7 @@ def deterministic_episode(
         group_id=episode_group_id,
         created_at=datetime.now(),
         valid_at=reference_time,
+        graphiti_ingest_complete=graphiti_ingest_complete,
     )
 
 
@@ -218,6 +220,10 @@ async def test_add_episode_with_new_uuid_creates_episode(
     async def return_episode(self, episode, *args, **kwargs):
         return [], episode
 
+    async def mark_complete(self, episodes):
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
     monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(missing_episode))
     monkeypatch.setattr(Graphiti, 'retrieve_episodes', no_previous_episodes)
     monkeypatch.setattr(graphiti_module, 'extract_nodes', no_extracted_nodes)
@@ -225,6 +231,7 @@ async def test_add_episode_with_new_uuid_creates_episode(
     monkeypatch.setattr(Graphiti, '_extract_and_resolve_edges', no_resolved_edges)
     monkeypatch.setattr(graphiti_module, 'extract_attributes_from_nodes', no_hydrated_nodes)
     monkeypatch.setattr(Graphiti, '_process_episode_data', return_episode)
+    monkeypatch.setattr(Graphiti, '_mark_deterministic_episodes_complete', mark_complete)
 
     graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
 
@@ -241,6 +248,7 @@ async def test_add_episode_with_new_uuid_creates_episode(
     assert result.episode.uuid == requested_uuid
     assert result.episode.group_id == group_id
     assert result.episode.content == 'user: Alice likes Bob'
+    assert result.episode.graphiti_ingest_complete is True
 
 
 @pytest.mark.asyncio
@@ -404,6 +412,73 @@ async def test_add_episode_with_existing_uuid_accepts_equivalent_reference_time(
 
 
 @pytest.mark.asyncio
+async def test_add_episode_with_existing_incomplete_uuid_reprocesses(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(
+        requested_uuid,
+        reference_time,
+        graphiti_ingest_complete=False,
+    )
+    processed_episodes: list[EpisodicNode] = []
+    marked_episodes: list[EpisodicNode] = []
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    async def no_previous_episodes(self, *args, **kwargs):
+        return []
+
+    async def no_extracted_nodes(*args, **kwargs):
+        return [], {}
+
+    async def no_resolved_nodes(*args, **kwargs):
+        return [], {}, []
+
+    async def no_resolved_edges(self, *args, **kwargs):
+        return [], [], []
+
+    async def no_hydrated_nodes(*args, **kwargs):
+        return []
+
+    async def capture_process(self, episode, *args, **kwargs):
+        processed_episodes.append(episode)
+        return [], episode
+
+    async def capture_complete(self, episodes):
+        marked_episodes.extend(episodes)
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+    monkeypatch.setattr(Graphiti, 'retrieve_episodes', no_previous_episodes)
+    monkeypatch.setattr(graphiti_module, 'extract_nodes', no_extracted_nodes)
+    monkeypatch.setattr(graphiti_module, 'resolve_extracted_nodes', no_resolved_nodes)
+    monkeypatch.setattr(Graphiti, '_extract_and_resolve_edges', no_resolved_edges)
+    monkeypatch.setattr(graphiti_module, 'extract_attributes_from_nodes', no_hydrated_nodes)
+    monkeypatch.setattr(Graphiti, '_process_episode_data', capture_process)
+    monkeypatch.setattr(Graphiti, '_mark_deterministic_episodes_complete', capture_complete)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode(
+        name='deterministic episode',
+        episode_body='user: Alice likes Bob',
+        source_description='test',
+        reference_time=reference_time,
+        source=EpisodeType.message,
+        group_id=group_id,
+        uuid=requested_uuid,
+    )
+
+    assert [episode.uuid for episode in processed_episodes] == [requested_uuid]
+    assert [episode.uuid for episode in marked_episodes] == [requested_uuid]
+    assert result.episode.graphiti_ingest_complete is True
+
+
+@pytest.mark.asyncio
 async def test_add_episode_with_uuid_rejects_raw_content_disabled_replay(
     monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
 ):
@@ -471,6 +546,66 @@ async def test_add_episode_bulk_with_existing_uuid_returns_without_processing(
     assert result.edges == []
     assert result.communities == []
     assert result.community_edges == []
+
+
+@pytest.mark.asyncio
+async def test_add_episode_bulk_with_existing_incomplete_uuid_reprocesses(
+    monkeypatch, mock_llm_client, mock_embedder, mock_cross_encoder_client
+):
+    requested_uuid = '11111111-1111-4111-8111-111111111111'
+    reference_time = datetime.now()
+    existing_episode = deterministic_episode(
+        requested_uuid,
+        reference_time,
+        graphiti_ingest_complete=False,
+    )
+    saved_episodes: list[EpisodicNode] = []
+    marked_episodes: list[EpisodicNode] = []
+
+    async def found_episode(cls, driver, uuid):
+        return existing_episode
+
+    async def capture_add_nodes_and_edges_bulk(
+        driver, episodic_nodes, episodic_edges, entity_nodes, entity_edges, embedder
+    ):
+        saved_episodes.extend(episodic_nodes)
+
+    async def no_previous_episodes(driver, episodes):
+        return [(episode, []) for episode in episodes]
+
+    async def no_extracted_nodes(self, *args, **kwargs):
+        return {}, {}, []
+
+    async def no_edges(*args, **kwargs):
+        return []
+
+    async def no_resolved_nodes_and_edges(self, *args, **kwargs):
+        return [], [], [], {}
+
+    async def capture_complete(self, episodes):
+        marked_episodes.extend(episodes)
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(found_episode))
+    monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', capture_add_nodes_and_edges_bulk)
+    monkeypatch.setattr(graphiti_module, 'retrieve_previous_episodes_bulk', no_previous_episodes)
+    monkeypatch.setattr(Graphiti, '_extract_and_dedupe_nodes_bulk', no_extracted_nodes)
+    monkeypatch.setattr(graphiti_module, 'dedupe_edges_bulk', no_edges)
+    monkeypatch.setattr(Graphiti, '_resolve_nodes_and_edges_bulk', no_resolved_nodes_and_edges)
+    monkeypatch.setattr(Graphiti, '_mark_deterministic_episodes_complete', capture_complete)
+
+    graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
+
+    result = await graphiti.add_episode_bulk(
+        [deterministic_raw_episode(requested_uuid, reference_time)],
+        group_id=group_id,
+    )
+
+    assert [episode.uuid for episode in saved_episodes] == [requested_uuid]
+    assert [episode.uuid for episode in marked_episodes] == [requested_uuid]
+    assert result.episodes == [existing_episode]
+    assert result.episodes[0].graphiti_ingest_complete is True
 
 
 @pytest.mark.asyncio
@@ -547,12 +682,17 @@ async def test_add_episode_bulk_with_new_uuid_saves_once_after_extraction(
     async def no_resolved_nodes_and_edges(self, *args, **kwargs):
         return [], [], [], {}
 
+    async def mark_complete(self, episodes):
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
     monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(missing_episode))
     monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', capture_add_nodes_and_edges_bulk)
     monkeypatch.setattr(graphiti_module, 'retrieve_previous_episodes_bulk', no_previous_episodes)
     monkeypatch.setattr(Graphiti, '_extract_and_dedupe_nodes_bulk', no_extracted_nodes)
     monkeypatch.setattr(graphiti_module, 'dedupe_edges_bulk', no_edges)
     monkeypatch.setattr(Graphiti, '_resolve_nodes_and_edges_bulk', no_resolved_nodes_and_edges)
+    monkeypatch.setattr(Graphiti, '_mark_deterministic_episodes_complete', mark_complete)
 
     graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
 
@@ -565,6 +705,7 @@ async def test_add_episode_bulk_with_new_uuid_saves_once_after_extraction(
 
     assert result.episodes[0].uuid == requested_uuid
     assert result.episodes[0].content == 'user: Alice likes Bob'
+    assert result.episodes[0].graphiti_ingest_complete is True
     assert [[episode.uuid for episode in batch] for batch in saved_batches] == [[requested_uuid]]
 
 
@@ -604,12 +745,17 @@ async def test_add_episode_bulk_with_mixed_existing_and_new_uuids_preserves_orde
     async def no_resolved_nodes_and_edges(self, *args, **kwargs):
         return [], [], [], {}
 
+    async def mark_complete(self, episodes):
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
     monkeypatch.setattr(EpisodicNode, 'get_by_uuid', classmethod(lookup_episode))
     monkeypatch.setattr(graphiti_module, 'add_nodes_and_edges_bulk', capture_add_nodes_and_edges_bulk)
     monkeypatch.setattr(graphiti_module, 'retrieve_previous_episodes_bulk', no_previous_episodes)
     monkeypatch.setattr(Graphiti, '_extract_and_dedupe_nodes_bulk', no_extracted_nodes)
     monkeypatch.setattr(graphiti_module, 'dedupe_edges_bulk', no_edges)
     monkeypatch.setattr(Graphiti, '_resolve_nodes_and_edges_bulk', no_resolved_nodes_and_edges)
+    monkeypatch.setattr(Graphiti, '_mark_deterministic_episodes_complete', mark_complete)
 
     graphiti = no_io_graphiti(mock_llm_client, mock_embedder, mock_cross_encoder_client)
 

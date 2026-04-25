@@ -47,6 +47,7 @@ class KuzuEpisodeNodeOperations(EpisodeNodeOperations):
             'source_description': node.source_description,
             'content': node.content,
             'entity_edges': node.entity_edges,
+            'graphiti_ingest_complete': node.graphiti_ingest_complete,
             'created_at': node.created_at,
             'valid_at': node.valid_at,
             'source': node.source.value,

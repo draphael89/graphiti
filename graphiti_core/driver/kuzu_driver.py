@@ -62,7 +62,8 @@ SCHEMA_QUERIES = """
         source_description STRING,
         content STRING,
         valid_at TIMESTAMP,
-        entity_edges STRING[]
+        entity_edges STRING[],
+        graphiti_ingest_complete BOOL
     );
     CREATE NODE TABLE IF NOT EXISTS Entity (
         uuid STRING PRIMARY KEY,
