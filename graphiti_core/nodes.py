@@ -326,6 +326,10 @@ class EpisodicNode(Node):
         description='list of entity edges referenced in this episode',
         default_factory=list,
     )
+    graphiti_ingest_complete: bool = Field(
+        description='whether deterministic replay can treat this episode as fully processed',
+        default=False,
+    )
     episode_metadata: dict[str, Any] | None = Field(
         description='customer-defined metadata key-value pairs for filtering',
         default=None,
@@ -345,6 +349,7 @@ class EpisodicNode(Node):
             'source_description': self.source_description,
             'content': self.content,
             'entity_edges': self.entity_edges,
+            'graphiti_ingest_complete': self.graphiti_ingest_complete,
             'created_at': self.created_at,
             'valid_at': self.valid_at,
             'source': self.source.value,
@@ -1038,6 +1043,7 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
         name=record['name'],
         source_description=record['source_description'],
         entity_edges=record['entity_edges'],
+        graphiti_ingest_complete=bool(record.get('graphiti_ingest_complete') or False),
     )
 
 

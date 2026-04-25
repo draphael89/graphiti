@@ -769,6 +769,23 @@ class Graphiti:
 
         return episodic_edges, primary_episode
 
+    async def _mark_deterministic_episodes_complete(self, episodes: list[EpisodicNode]) -> None:
+        if not episodes:
+            return
+
+        uuids = [episode.uuid for episode in episodes]
+        await self.driver.execute_query(
+            """
+            MATCH (e:Episodic)
+            WHERE e.uuid IN $uuids
+            SET e.graphiti_ingest_complete = true
+            RETURN e.uuid AS uuid
+            """,
+            uuids=uuids,
+        )
+        for episode in episodes:
+            episode.graphiti_ingest_complete = True
+
     async def _extract_and_dedupe_nodes_bulk(
         self,
         episode_context: list[tuple[EpisodicNode, list[EpisodicNode]]],
@@ -1093,6 +1110,11 @@ class Graphiti:
                             source,
                             reference_time,
                         )
+                        if not episode.graphiti_ingest_complete:
+                            logger.info(
+                                f'Reprocessing incomplete deterministic episode replay {uuid}'
+                            )
+                            raise NodeNotFoundError(uuid)
                         end = time()
                         span.add_attributes(
                             {
@@ -1216,6 +1238,8 @@ class Graphiti:
                     saga_previous_episode_uuid,
                     node_episode_index_map,
                 )
+                if uuid is not None:
+                    await self._mark_deterministic_episodes_complete([episode])
 
                 # Update communities if requested
                 communities = []
@@ -1356,6 +1380,7 @@ class Graphiti:
 
                 episodes: list[EpisodicNode] = []
                 new_episodes: list[EpisodicNode] = []
+                deterministic_episodes_to_mark: list[EpisodicNode] = []
                 requested_uuids: set[str] = set()
 
                 for raw_episode in bulk_episodes:
@@ -1384,6 +1409,14 @@ class Graphiti:
                                 raw_episode.source,
                                 raw_episode.reference_time,
                             )
+                            if not episode.graphiti_ingest_complete:
+                                logger.info(
+                                    f'Reprocessing incomplete deterministic episode replay {raw_episode.uuid}'
+                                )
+                                episodes.append(episode)
+                                new_episodes.append(episode)
+                                deterministic_episodes_to_mark.append(episode)
+                                continue
                             episodes.append(episode)
                             continue
                         except NodeNotFoundError:
@@ -1405,6 +1438,8 @@ class Graphiti:
                     episode = EpisodicNode(**episode_kwargs)
                     episodes.append(episode)
                     new_episodes.append(episode)
+                    if raw_episode.uuid is not None:
+                        deterministic_episodes_to_mark.append(episode)
 
                 if not new_episodes:
                     end = time()
@@ -1537,6 +1572,8 @@ class Graphiti:
                             saga_node.first_episode_uuid = sorted_episodes[0].uuid
                         saga_node.last_episode_uuid = sorted_episodes[-1].uuid
                         await saga_node.save(self.driver)
+
+                await self._mark_deterministic_episodes_complete(deterministic_episodes_to_mark)
 
                 end = time()
 

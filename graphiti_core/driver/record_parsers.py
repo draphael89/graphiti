@@ -105,6 +105,7 @@ def episodic_node_from_record(record: Any) -> EpisodicNode:
         name=record['name'],
         source_description=record['source_description'],
         entity_edges=record['entity_edges'],
+        graphiti_ingest_complete=bool(record.get('graphiti_ingest_complete') or False),
     )
 
 

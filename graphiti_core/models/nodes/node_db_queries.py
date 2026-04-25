@@ -33,7 +33,7 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: join([x IN coalesce($entity_edges, []) | toString(x) ], '|'), created_at: $created_at, valid_at: $valid_at}
+                entity_edges: join([x IN coalesce($entity_edges, []) | toString(x) ], '|'), graphiti_ingest_complete: $graphiti_ingest_complete, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.KUZU:
@@ -47,21 +47,22 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
                     n.source_description = $source_description,
                     n.content = $content,
                     n.valid_at = $valid_at,
-                    n.entity_edges = $entity_edges
+                    n.entity_edges = $entity_edges,
+                    n.graphiti_ingest_complete = $graphiti_ingest_complete
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.FALKORDB:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
+                entity_edges: $entity_edges, graphiti_ingest_complete: $graphiti_ingest_complete, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
+                entity_edges: $entity_edges, graphiti_ingest_complete: $graphiti_ingest_complete, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
             """
 
@@ -74,7 +75,7 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 MERGE (n:Episodic {uuid: episode.uuid})
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description,
                     source: episode.source, content: episode.content,
-                entity_edges: join([x IN coalesce(episode.entity_edges, []) | toString(x) ], '|'), created_at: episode.created_at, valid_at: episode.valid_at}
+                entity_edges: join([x IN coalesce(episode.entity_edges, []) | toString(x) ], '|'), graphiti_ingest_complete: episode.graphiti_ingest_complete, created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.KUZU:
@@ -88,7 +89,8 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                     n.source_description = $source_description,
                     n.content = $content,
                     n.valid_at = $valid_at,
-                    n.entity_edges = $entity_edges
+                    n.entity_edges = $entity_edges,
+                    n.graphiti_ingest_complete = $graphiti_ingest_complete
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.FALKORDB:
@@ -96,7 +98,7 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 UNWIND $episodes AS episode
                 MERGE (n:Episodic {uuid: episode.uuid})
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content, 
-                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
+                entity_edges: episode.entity_edges, graphiti_ingest_complete: episode.graphiti_ingest_complete, created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
@@ -104,7 +106,7 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 UNWIND $episodes AS episode
                 MERGE (n:Episodic {uuid: episode.uuid})
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content, 
-                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
+                entity_edges: episode.entity_edges, graphiti_ingest_complete: episode.graphiti_ingest_complete, created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid
             """
 
@@ -118,7 +120,8 @@ EPISODIC_NODE_RETURN = """
     e.source_description AS source_description,
     e.content AS content,
     e.valid_at AS valid_at,
-    e.entity_edges AS entity_edges
+    e.entity_edges AS entity_edges,
+    coalesce(e.graphiti_ingest_complete, false) AS graphiti_ingest_complete
 """
 
 EPISODIC_NODE_RETURN_NEPTUNE = """
@@ -130,7 +133,8 @@ EPISODIC_NODE_RETURN_NEPTUNE = """
     e.group_id AS group_id,
     e.source_description AS source_description,
     e.source AS source,
-    split(e.entity_edges, ",") AS entity_edges
+    split(e.entity_edges, ",") AS entity_edges,
+    coalesce(e.graphiti_ingest_complete, false) AS graphiti_ingest_complete
 """
 
 
