@@ -52,4 +52,6 @@ async def test_structured_completion_adds_additional_properties_false_to_objects
 
     assert response_format['type'] == 'json_schema'
     assert schema['additionalProperties'] is False
+    assert schema['required'] == ['items']
     assert schema['$defs']['NestedResponseModel']['additionalProperties'] is False
+    assert schema['$defs']['NestedResponseModel']['required'] == ['name', 'values']

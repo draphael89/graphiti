@@ -45,6 +45,9 @@ def add_additional_properties_false(value: Any) -> None:
     if isinstance(value, dict):
         if value.get('type') == 'object' or 'properties' in value:
             value['additionalProperties'] = False
+            properties = value.get('properties')
+            if isinstance(properties, dict):
+                value['required'] = list(properties.keys())
         for item in value.values():
             add_additional_properties_false(item)
         return
