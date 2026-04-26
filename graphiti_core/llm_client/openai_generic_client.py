@@ -17,6 +17,7 @@ limitations under the License.
 import json
 import logging
 import typing
+from copy import deepcopy
 from typing import Any, ClassVar
 
 import openai
@@ -32,6 +33,25 @@ from .errors import RateLimitError, RefusalError
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
+
+
+def strict_object_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(schema)
+    add_additional_properties_false(normalized)
+    return normalized
+
+
+def add_additional_properties_false(value: Any) -> None:
+    if isinstance(value, dict):
+        if value.get('type') == 'object' or 'properties' in value:
+            value['additionalProperties'] = False
+        for item in value.values():
+            add_additional_properties_false(item)
+        return
+
+    if isinstance(value, list):
+        for item in value:
+            add_additional_properties_false(item)
 
 
 class OpenAIGenericClient(LLMClient):
@@ -111,7 +131,7 @@ class OpenAIGenericClient(LLMClient):
             response_format: dict[str, Any] = {'type': 'json_object'}
             if response_model is not None:
                 schema_name = getattr(response_model, '__name__', 'structured_response')
-                json_schema = response_model.model_json_schema()
+                json_schema = strict_object_json_schema(response_model.model_json_schema())
                 response_format = {
                     'type': 'json_schema',
                     'json_schema': {
