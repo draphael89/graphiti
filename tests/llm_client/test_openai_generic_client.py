@@ -153,3 +153,35 @@ async def test_retry_keeps_exactly_one_error_context_turn():
         m for m in messages if m.content.startswith('The previous response attempt was invalid.')
     ]
     assert len(error_turns) == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_callback_receives_token_counts_and_never_fails_the_call():
+    class UsageChatCompletions(DummyChatCompletions):
+        async def create(self, **kwargs):
+            self.create_calls.append(kwargs)
+            message = SimpleNamespace(content='{"items":[]}')
+            choice = SimpleNamespace(message=message)
+            usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+            return SimpleNamespace(choices=[choice], usage=usage)
+
+    dummy_client = DummyClient()
+    dummy_client.chat.completions = UsageChatCompletions()
+    client = OpenAIGenericClient(
+        config=LLMConfig(api_key='test-key', base_url='https://llm.test/v1', model='m'),
+        client=dummy_client,
+    )
+    received = []
+    client.usage_callback = lambda *args: received.append(args)
+
+    result = await client._generate_response(messages=[], response_model=ResponseModel)
+    assert result == {'items': []}
+    assert received == [('m', 100, 20, 120)]
+
+    # A raising callback must never fail the call that produced the tokens.
+    def boom(*_args):
+        raise RuntimeError('telemetry boom')
+
+    client.usage_callback = boom
+    result = await client._generate_response(messages=[], response_model=ResponseModel)
+    assert result == {'items': []}

@@ -164,14 +164,26 @@ class OpenAIGenericClient(LLMClient):
             if usage is not None:
                 # Token telemetry: usage was discarded entirely, making
                 # cost-per-episode unobservable everywhere downstream. One
-                # structured line per call; consumers aggregate.
+                # structured line per call; consumers aggregate — either via
+                # this log line or the optional usage_callback attribute
+                # (set by the consumer; exceptions in it must never fail the
+                # LLM call that produced the tokens).
+                prompt_tokens = getattr(usage, 'prompt_tokens', None)
+                completion_tokens = getattr(usage, 'completion_tokens', None)
+                total_tokens = getattr(usage, 'total_tokens', None)
                 logger.info(
                     'llm_usage prompt_tokens=%s completion_tokens=%s total_tokens=%s model=%s',
-                    getattr(usage, 'prompt_tokens', None),
-                    getattr(usage, 'completion_tokens', None),
-                    getattr(usage, 'total_tokens', None),
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
                     model,
                 )
+                usage_callback = getattr(self, 'usage_callback', None)
+                if callable(usage_callback):
+                    try:
+                        usage_callback(model, prompt_tokens, completion_tokens, total_tokens)
+                    except Exception:
+                        logger.warning('usage_callback raised; ignoring', exc_info=True)
             result = response.choices[0].message.content or ''
             return json.loads(result)
         except openai.RateLimitError as e:
