@@ -168,3 +168,62 @@ async def test_non_retryable_error_is_not_retried():
         await client.generate_response(_messages(), response_model=ResponseModel)
 
     assert len(completions.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_small_model_size_routes_to_small_model():
+    from graphiti_core.llm_client.config import ModelSize
+
+    completions = DummyChatCompletions(content='{"foo": "bar"}')
+    client = OpenAIGenericClient(
+        config=LLMConfig(api_key='test', model='primary-model', small_model='small-model'),
+        client=DummyClient(completions),
+    )
+    await client._generate_response(
+        _messages(), response_model=ResponseModel, model_size=ModelSize.small
+    )
+    await client._generate_response(
+        _messages(), response_model=ResponseModel, model_size=ModelSize.medium
+    )
+    assert completions.create_calls[0]['model'] == 'small-model'
+    assert completions.create_calls[1]['model'] == 'primary-model'
+
+
+@pytest.mark.asyncio
+async def test_small_model_size_falls_back_to_primary_without_small_model():
+    from graphiti_core.llm_client.config import ModelSize
+
+    client, completions = _make_client()
+    await client._generate_response(
+        _messages(), response_model=ResponseModel, model_size=ModelSize.small
+    )
+    assert completions.create_calls[0]['model'] == 'test-model'
+
+
+@pytest.mark.asyncio
+async def test_usage_callback_receives_token_counts_and_never_fails_the_call():
+    class UsageChatCompletions(DummyChatCompletions):
+        async def create(self, **kwargs):
+            self.create_calls.append(kwargs)
+            message = SimpleNamespace(content='{"foo": "bar"}')
+            choice = SimpleNamespace(message=message)
+            usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+            return SimpleNamespace(choices=[choice], usage=usage)
+
+    completions = UsageChatCompletions(content='{"foo": "bar"}')
+    client = OpenAIGenericClient(
+        config=LLMConfig(api_key='test', model='m'),
+        client=DummyClient(completions),
+    )
+    received = []
+    client.usage_callback = lambda *args: received.append(args)
+    result = await client._generate_response(_messages(), response_model=ResponseModel)
+    assert result == {'foo': 'bar'}
+    assert received == [('m', 100, 20, 120)]
+
+    def boom(*_args):
+        raise RuntimeError('telemetry boom')
+
+    client.usage_callback = boom
+    result = await client._generate_response(_messages(), response_model=ResponseModel)
+    assert result == {'foo': 'bar'}

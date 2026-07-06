@@ -152,13 +152,43 @@ class OpenAIGenericClient(LLMClient):
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
         try:
+            # Route small-tier calls (dedupe adjudication, summaries,
+            # timestamps) to the configured small model when one exists;
+            # ModelSize.medium and an unconfigured small_model both fall back
+            # to the primary model, so behavior is unchanged until configured.
+            model = self.model or DEFAULT_MODEL
+            if model_size == ModelSize.small and self.small_model:
+                model = self.small_model
             response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
+                model=model,
                 messages=openai_messages,
                 temperature=self.temperature,
                 max_tokens=max_tokens,
                 response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
             )
+            usage = getattr(response, 'usage', None)
+            if usage is not None:
+                # Token telemetry: usage was discarded entirely, making
+                # cost-per-episode unobservable downstream. One structured
+                # line per call; consumers aggregate — either via this log
+                # line or the optional usage_callback attribute (exceptions
+                # in it must never fail the call that produced the tokens).
+                prompt_tokens = getattr(usage, 'prompt_tokens', None)
+                completion_tokens = getattr(usage, 'completion_tokens', None)
+                total_tokens = getattr(usage, 'total_tokens', None)
+                logger.info(
+                    'llm_usage prompt_tokens=%s completion_tokens=%s total_tokens=%s model=%s',
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    model,
+                )
+                usage_callback = getattr(self, 'usage_callback', None)
+                if callable(usage_callback):
+                    try:
+                        usage_callback(model, prompt_tokens, completion_tokens, total_tokens)
+                    except Exception:
+                        logger.warning('usage_callback raised; ignoring', exc_info=True)
             result = response.choices[0].message.content or ''
             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
             # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
