@@ -143,13 +143,35 @@ class OpenAIGenericClient(LLMClient):
                     },
                 }
 
+            # Route small-tier calls (dedupe adjudication, summaries,
+            # timestamps) to the configured small model when one exists;
+            # ModelSize.medium and an unconfigured small_model both fall back
+            # to the primary model, so behavior is unchanged until configured.
+            model = self.model or DEFAULT_MODEL
+            if model_size == ModelSize.small and self.small_model:
+                model = self.small_model
             response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
+                model=model,
                 messages=openai_messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                # Honor the per-call budget: this previously sent
+                # self.max_tokens (16384) for EVERY call, including tiny
+                # dedupe/timestamp calls whose callers asked for far less.
+                max_tokens=max_tokens,
                 response_format=response_format,  # type: ignore[arg-type]
             )
+            usage = getattr(response, 'usage', None)
+            if usage is not None:
+                # Token telemetry: usage was discarded entirely, making
+                # cost-per-episode unobservable everywhere downstream. One
+                # structured line per call; consumers aggregate.
+                logger.info(
+                    'llm_usage prompt_tokens=%s completion_tokens=%s total_tokens=%s model=%s',
+                    getattr(usage, 'prompt_tokens', None),
+                    getattr(usage, 'completion_tokens', None),
+                    getattr(usage, 'total_tokens', None),
+                    model,
+                )
             result = response.choices[0].message.content or ''
             return json.loads(result)
         except openai.RateLimitError as e:
@@ -227,7 +249,16 @@ class OpenAIGenericClient(LLMClient):
                     )
 
                     error_message = Message(role='user', content=error_context)
-                    messages.append(error_message)
+                    # Cap the retry amplifier: appending a NEW error turn each
+                    # attempt resent the entire growing conversation (with the
+                    # old 16384 max_tokens this multiplied a flaky response's
+                    # cost). Keep exactly one trailing error-context turn.
+                    if messages and messages[-1].content.startswith(
+                        'The previous response attempt was invalid.'
+                    ):
+                        messages[-1] = error_message
+                    else:
+                        messages.append(error_message)
                     logger.warning(
                         f'Retrying after application error (attempt {retry_count}/{self.MAX_RETRIES}): {e}'
                     )
