@@ -16,8 +16,10 @@ limitations under the License.
 
 import asyncio
 import datetime
+import hashlib
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -71,6 +73,11 @@ from graphiti_core.helpers import validate_group_ids
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 
 logger = logging.getLogger(__name__)
+
+
+def _query_fingerprint(query: str) -> str:
+    normalized = ' '.join(query.split()).encode('utf-8', errors='replace')
+    return hashlib.sha256(normalized).hexdigest()[:16]
 
 
 def _strip_nul_bytes(value: Any) -> Any:
@@ -237,6 +244,7 @@ class FalkorDriver(GraphDriver):
 
     async def execute_query(self, cypher_query_, **kwargs: Any):
         graph = self._get_graph(self._database)
+        started = time.perf_counter()
 
         # Convert datetime objects to ISO strings (FalkorDB does not support datetime objects directly)
         params = convert_datetimes_to_strings(dict(kwargs))
@@ -245,11 +253,18 @@ class FalkorDriver(GraphDriver):
         try:
             result = await graph.query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
         except Exception as e:
+            log_context = {
+                'database': self._database,
+                'duration_ms': round((time.perf_counter() - started) * 1000, 2),
+                'error_category': type(e).__name__,
+                'param_keys': sorted(kwargs),
+                'query_fingerprint': _query_fingerprint(cypher_query_),
+            }
             if 'already indexed' in str(e):
                 # check if index already exists
-                logger.info(f'Index already exists: {e}')
+                logger.info('FalkorDB index already exists', extra=log_context)
                 return None
-            logger.error(f'Error executing FalkorDB query: {e}\n{cypher_query_}\n{params}')
+            logger.error('FalkorDB query failed', extra=log_context)
             raise
 
         # Convert the result header to a list of strings

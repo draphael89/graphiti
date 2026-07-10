@@ -142,6 +142,50 @@ class TestFalkorDriver:
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
+    async def test_execute_query_failure_log_never_contains_graph_content(self):
+        sentinel = 'REF1422 private graph prose'
+        query = f"MATCH (n) WHERE n.fact = '{sentinel}' RETURN n"
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock(
+            side_effect=RuntimeError(f'{sentinel}: query and params rejected')
+        )
+        self.mock_client.select_graph.return_value = mock_graph
+
+        with (
+            patch('graphiti_core.driver.falkordb_driver.logger') as mock_logger,
+            pytest.raises(RuntimeError, match='REF1422'),
+        ):
+            await self.driver.execute_query(
+                query,
+                fact=sentinel,
+                embedding=[0.1, 0.2],
+            )
+
+        args, kwargs = mock_logger.error.call_args
+        rendered = repr((args, kwargs))
+        assert sentinel not in rendered
+        assert query not in rendered
+        assert args == ('FalkorDB query failed',)
+        assert kwargs['extra']['error_category'] == 'RuntimeError'
+        assert kwargs['extra']['param_keys'] == ['embedding', 'fact']
+        assert len(kwargs['extra']['query_fingerprint']) == 16
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
+    async def test_execute_query_index_log_never_contains_exception_text(self):
+        sentinel = 'REF1422 private index prose'
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock(side_effect=RuntimeError(f'already indexed: {sentinel}'))
+        self.mock_client.select_graph.return_value = mock_graph
+
+        with patch('graphiti_core.driver.falkordb_driver.logger') as mock_logger:
+            result = await self.driver.execute_query('CREATE INDEX FOR (n:Entity) ON (n.uuid)')
+
+        assert result is None
+        assert sentinel not in repr(mock_logger.info.call_args)
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
     async def test_execute_query_converts_datetime_parameters(self):
         """Test that datetime objects in kwargs are converted to ISO strings."""
         mock_graph = MagicMock()
